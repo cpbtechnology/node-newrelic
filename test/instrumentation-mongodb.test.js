@@ -1,41 +1,13 @@
 'use strict';
 
 var path   = require('path')
-  , util   = require('util')
   , chai   = require('chai')
   , expect = chai.expect
   , should = chai.should()
-  , sinon  = require('sinon')
-  , bson   = require('bson')
   , helper = require(path.join(__dirname, 'lib', 'agent_helper'))
   ;
 
-function dox() {
-  return {documents : [{}]};
-}
-
 describe("agent instrumentation of MongoDB", function () {
-  var agent
-    , mongodb
-    , db
-    , pkfactory
-    ;
-
-  beforeEach(function () {
-    agent = helper.instrumentMockedAgent();
-
-    // load the driver after loading is patched
-    mongodb = require('mongodb');
-
-    var serverConfig = new mongodb.Server('localhost', 27017);
-    db = new mongodb.Db('notreal', serverConfig, {safe : true});
-    pkfactory = mongodb.ObjectID;
-  });
-
-  afterEach(function () {
-    helper.unloadAgent(agent);
-  });
-
   describe("shouldn't cause bootstrapping to fail", function () {
     var agent
       , initialize
@@ -47,6 +19,10 @@ describe("agent instrumentation of MongoDB", function () {
                                      'instrumentation', 'mongodb'));
     });
 
+    after(function () {
+      helper.unloadAgent(agent);
+    });
+
     it("when passed no module", function () {
       expect(function () { initialize(agent); }).not.throws();
     });
@@ -56,194 +32,107 @@ describe("agent instrumentation of MongoDB", function () {
     });
   });
 
-  describe("for each operation", function () {
-    beforeEach(function (done) {
-      sinon.stub(db, '_executeInsertCommand', function (inserter, options, callback) {
-        callback(null, dox());
-      });
+  describe("with child MongoDB operations", function () {
+    var agent
+      , transaction
+      , collection
+      , error
+      , removed
+      ;
 
-      agent.once('transactionFinished', function () {
-        return done();
-      });
+    before(function (done) {
+      function StubCollection (name) {
+        this.collectionName = name;
+      }
 
-      helper.runInTransaction(agent, function () {
-        var collection = new mongodb.Collection(db, 'fake', pkfactory);
-        collection.insert({id : 1, hamchunx : 'verbloks'},
-                          {safe : true},
-                          function (error, result) {
-          if (error) return done(error);
+      StubCollection.prototype.findAndRemove = function (terms, options, callback) {
+        this.findAndModify(terms, options, callback);
+      };
 
-          var transaction = agent.getTransaction();
-          should.exist(transaction);
+      StubCollection.prototype.findAndModify = function (terms, options, callback) {
+        this.terms = terms;
+        this.options = options;
+        process.nextTick(function () {
+          callback(null, 1);
+        });
+      };
+
+      var mockodb = {Collection : StubCollection};
+
+      agent = helper.loadMockedAgent();
+      agent.on('transactionFinished', done.bind(null, null));
+
+      var initialize = require(path.join(__dirname, '..', 'lib',
+                                     'instrumentation', 'mongodb'));
+      initialize(agent, mockodb);
+
+      collection = new mockodb.Collection('test');
+
+      helper.runInTransaction(agent, function (trans) {
+        transaction = trans;
+        collection.findAndRemove({val : 'hi'}, {w : 333}, function (err, rem) {
+          error = err;
+          removed = rem;
 
           transaction.end();
         });
       });
     });
 
-    it("should update the global database aggregate statistics", function () {
-      var stats = agent.metrics.getMetric('Database/all').stats;
-      expect(stats.callCount).equal(1);
+    after(function () {
+      helper.unloadAgent(agent);
     });
 
-    it("should update the aggregate statistics for the operation type", function () {
-      var stats = agent.metrics.getMetric('Database/insert').stats;
-      expect(stats.callCount).equal(1);
+    it("should have left the query terms alone", function () {
+      expect(collection.terms).eql({val : 'hi'});
     });
 
-    it("should update the aggregate statistics for the specific query", function () {
-      var stats = agent.metrics.getMetric('Database/fake/insert').stats;
-      expect(stats.callCount).equal(1);
+    it("should have left the query options alone", function () {
+      expect(collection.options).eql({w : 333});
     });
 
-    it("should update the scoped aggregate statistics for the operation type", function () {
-      var stats = agent.metrics.getMetric('Database/fake/insert', 'MongoDB/fake/insert').stats;
-      expect(stats.callCount).equal(1);
-    });
-  });
-
-  it("should instrument inserting documents", function (done) {
-    sinon.stub(db, '_executeInsertCommand', function (inserter, options, callback) {
-      callback(null, dox());
+    it("shouldn't have messed with the error parameter", function () {
+      should.not.exist(error);
     });
 
-    agent.once('transactionFinished', function () {
-      var stats = agent.metrics.getMetric('Database/fake/insert', 'MongoDB/fake/insert').stats;
-      expect(stats.callCount).equal(1);
-
-      return done();
+    it("shouldn't have messed with the result parameter", function () {
+      expect(removed).equal(1);
     });
 
-    helper.runInTransaction(agent, function () {
-      var collection = new mongodb.Collection(db, 'fake', pkfactory);
-      collection.insert({id : 1, hamchunx : 'verbloks'},
-                        {safe : true},
-                        function (error, result) {
-        if (error) return done(error);
-
-        var transaction = agent.getTransaction();
-        should.exist(transaction);
-
-        transaction.end();
-      });
-    });
-  });
-
-  it("should instrument finding documents", function (done) {
-    var returned = false;
-    sinon.stub(mongodb.Cursor.prototype, 'nextObject', function (callback) {
-      if (!returned) {
-        returned = true;
-        callback(null, {id : 1, hamchunx : 'verbloks'});
-      }
-      else {
-        callback(null, null);
-      }
+    it("should have only one segment (the parent) under the trace root", function () {
+      var root = transaction.getTrace().root;
+      expect(root.children.length).equal(1);
     });
 
-    agent.once('transactionFinished', function () {
-      var stats = agent.metrics.getMetric('Database/fake/find', 'MongoDB/fake/find').stats;
-      expect(stats.callCount).equal(1);
+    it("should have recorded the findAndRemove operation", function () {
+      var root   = transaction.getTrace().root
+        , parent = root.children[0]
+        ;
 
-      mongodb.Cursor.prototype.nextObject.restore();
-      return done();
+      expect(parent.name).equal('MongoDB/test/findAndRemove');
     });
 
-    helper.runInTransaction(agent, function () {
-      var collection = new mongodb.Collection(db, 'fake', pkfactory);
-      collection.findOne({id : 1},
-                         {safe : true},
-                         function (error, result) {
-        if (error) return done(error);
+    it("should have no child segments under the parent", function () {
+      var root   = transaction.getTrace().root
+        , parent = root.children[0]
+        ;
 
-        should.exist(result);
-
-        var transaction = agent.getTransaction();
-        should.exist(transaction);
-
-        transaction.end();
-      });
-    });
-  });
-
-  it("should instrument updating documents", function (done) {
-    sinon.stub(db, '_executeUpdateCommand', function (updater, options, callback) {
-      callback(null, dox());
+      expect(parent.children.length).equal(0);
     });
 
-    agent.once('transactionFinished', function () {
-      var stats = agent.metrics.getMetric('Database/fake/update', 'MongoDB/fake/update').stats;
-      expect(stats.callCount).equal(1);
-
-      return done();
+    it("should have gathered metrics", function () {
+      var metrics = transaction.metrics;
+      should.exist(metrics);
     });
 
-    helper.runInTransaction(agent, function () {
-      var collection = new mongodb.Collection(db, 'fake', pkfactory);
-      collection.update({a:1},
-                        {$set:{b:2}},
-                        function (error, results) {
-        if (error) return done(error);
-
-        var transaction = agent.getTransaction();
-        should.exist(transaction);
-
-        transaction.end();
-      });
-    });
-  });
-
-  it("should instrument removing documents", function (done) {
-    sinon.stub(db, '_executeRemoveCommand', function (updater, options, callback) {
-      callback(null, dox());
+    it("should have recorded only one database call", function () {
+      var metrics = transaction.metrics;
+      expect(metrics.getMetric('Database/all').callCount).equal(1);
     });
 
-    agent.once('transactionFinished', function () {
-      var stats = agent.metrics.getMetric('Database/fake/remove', 'MongoDB/fake/remove').stats;
-      expect(stats.callCount).equal(1);
-
-      return done();
-    });
-
-    helper.runInTransaction(agent, function () {
-      var collection = new mongodb.Collection(db, 'fake', pkfactory);
-      collection.remove({a:1},
-                        {safe : true},
-                        function (error, result) {
-        if (error) return done(error);
-
-        var transaction = agent.getTransaction();
-        should.exist(transaction);
-
-        transaction.end();
-      });
-    });
-  });
-
-  it("should instrument saving documents", function (done) {
-    sinon.stub(db, '_executeInsertCommand', function (inserter, options, callback) {
-      callback(null, dox());
-    });
-
-    agent.once('transactionFinished', function () {
-      var stats = agent.metrics.getMetric('Database/fake/insert', 'MongoDB/fake/insert').stats;
-      expect(stats.callCount).equal(1);
-
-      return done();
-    });
-
-    helper.runInTransaction(agent, function () {
-      var collection = new mongodb.Collection(db, 'fake', pkfactory);
-      collection.save({hamchunx : 'verblox'},
-                      {safe : true},
-                      function (error, result) {
-        if (error) return done(error);
-
-        var transaction = agent.getTransaction();
-        should.exist(transaction);
-
-        transaction.end();
-      });
+    it("should have that call be the findAndRemove", function () {
+      var metrics = transaction.metrics;
+      expect(metrics.getMetric('MongoDB/test/findAndRemove').callCount).equal(1);
     });
   });
 });
